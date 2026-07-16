@@ -2,7 +2,8 @@
 
 Local AI text-to-speech with voice cloning and voice design, powered
 by GGML. C++17 port of OmniVoice (k2-fsa/OmniVoice). 646 languages,
-24 kHz mono output, runs on CPU, CUDA, ROCm, Metal, Vulkan.
+native 24 kHz mono output with an optional VoxCPM2 AudioVAE path to
+48 kHz, runs on CPU, CUDA, ROCm, Metal, Vulkan.
 
 ## Features
 
@@ -15,8 +16,10 @@ by GGML. C++17 port of OmniVoice (k2-fsa/OmniVoice). 646 languages,
 - Bit deterministic generation in greedy mode, seedable Philox PRNG
   for stochastic sampling
 - Q8_0 quantisation of the 612 M parameter Qwen3 backbone
-- Two CLI tools : `omnivoice-tts` (text -> WAV) and `omnivoice-codec`
-  (WAV <-> RVQ codes)
+- Optional VAE-only GGUF enhancement from 24 kHz to 48 kHz on the same
+  backend, with bounded-memory long-audio chunking
+- Three CLI tools : `omnivoice-tts` (text -> WAV), `omnivoice-codec`
+  (WAV <-> RVQ codes), and `omnivoice-upscale` (standalone AudioVAE)
 
 ## Build
 
@@ -44,6 +47,20 @@ the original checkpoint :
 ./convert.py          # 2 GGUFs in BF16 -> models/
 ./quantize.sh         # base LM Q8_0 (tokenizer stays at native dtype)
 ```
+
+The optional 48 kHz path uses a third, independently converted model:
+
+```sh
+python tools/convert-voxcpm2-audiovae.py \
+    --input /path/to/openbmb/VoxCPM2 \
+    --output models/voxcpm2-audiovae-f16.gguf
+```
+
+The current mixed F16/F32 VAE-only GGUF is 187,868,032 bytes. The
+converter folds weight normalization, omits the unused `fc_logvar`
+head, strictly audits every source tensor, and embeds the source
+checkpoint SHA-256 and license provenance. See
+[docs/VOXCPM2_AUDIOVAE_TOOLING.md](docs/VOXCPM2_AUDIOVAE_TOOLING.md).
 
 ## Quick start
 
@@ -91,6 +108,8 @@ struct ov_init_params iparams;
 ov_init_default_params(&iparams);
 iparams.model_path = "models/omnivoice-base-Q8_0.gguf";
 iparams.codec_path = "models/omnivoice-tokenizer-F32.gguf";
+/* Optional ABI v4 field. Omit for native 24 kHz output. */
+iparams.upscaler_path = "models/voxcpm2-audiovae-f16.gguf";
 
 struct ov_context * ov = ov_init(&iparams);
 
@@ -104,6 +123,20 @@ ov_synthesize(ov, &params, &audio);
 /* audio.samples, audio.n_samples, audio.sample_rate, audio.channels */
 ov_audio_free(&audio);
 ov_free(ov);
+```
+
+`OV_ABI_VERSION` is 4. A non-NULL `upscaler_path` eagerly loads the
+VAE on the same backend and makes buffered synthesis return 48 kHz.
+Native `on_chunk` callback streaming currently requires the 24 kHz
+path; use buffered synthesis when the upscaler is loaded.
+
+The standalone parity/benchmark path accepts either 24 kHz input or
+an already-resampled 16 kHz reference:
+
+```sh
+./build/omnivoice-upscale \
+    --model models/voxcpm2-audiovae-f16.gguf \
+    -i input.wav -o output-48k.wav
 ```
 
 `tests/abi-c.c` is built with `-std=c99 -Wall -Werror -pedantic` on
@@ -126,3 +159,5 @@ MIT. See [LICENSE](LICENSE).
 Upstream model : OmniVoice by Xiaomi / k2-fsa, Apache 2.0.
 Audio codec : Higgs Audio v2 (`bosonai/higgs-audio-v2-tokenizer`),
 Apache 2.0.
+Optional AudioVAE : VoxCPM2 by OpenBMB, Apache 2.0. Tensor naming and
+graph mapping were informed by CrispASR, MIT.

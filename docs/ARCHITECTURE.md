@@ -57,6 +57,11 @@ and Vulkan kernels.
 ./checkpoints.sh    # hf download k2-fsa/OmniVoice -> checkpoints/OmniVoice/
 ./convert.py        # 2 GGUFs in BF16 -> models/
 ./quantize.sh       # base LM Q8_0 (tokenizer stays at native dtype)
+
+# Optional VoxCPM2 AudioVAE (requires local audiovae.pth + config.json)
+python tools/convert-voxcpm2-audiovae.py \
+  --input /path/to/openbmb/VoxCPM2 \
+  --output models/voxcpm2-audiovae-f16.gguf
 ```
 
 Outputs :
@@ -65,6 +70,7 @@ Outputs :
 models/omnivoice-base-BF16.gguf       1.2 GB    LLM + audio_emb + audio_heads + tokenizer
 models/omnivoice-base-Q8_0.gguf       626 MB    quantized base, 1.9x smaller
 models/omnivoice-tokenizer-F32.gguf   702 MB    HuBERT + DAC + RVQ + fc/fc2 (native F32)
+models/voxcpm2-audiovae-f16.gguf      179 MB    optional 16 kHz encode / 48 kHz decode VAE
 ```
 
 The audio tokenizer GGUF preserves the source dtype 1:1. The reference
@@ -76,6 +82,15 @@ intermediate weight is rounded to BF16.
 Quantisation policy : Q8_0 only on the base LM. The 612 M parameter
 backbone is small enough that lower quants degrade quality without
 meaningful size gains.
+
+The optional VAE converter consumes OpenBMB's `audiovae.pth`, folds
+all 75 PyTorch weight-normalisation pairs with `dim=0`, omits the
+unused encoder `fc_logvar`, stores large convolution weights in F16,
+and keeps biases, Snake alpha and sample-rate embeddings in F32. It
+strictly audits all source keys and writes 233 tensors. The current
+output is exactly 187,868,032 bytes. The GGUF records its source
+checkpoint SHA-256 because OpenBMB has published more than one file
+under the same checkpoint name.
 
 ## GGUF layout
 
@@ -162,6 +177,14 @@ Single weight_norm fold at convert time :
 `weight = v * g / ||v||_{dim=(0,1)}` matching
 `torch._weight_norm(v, g, dim=2)`. Validated bit-perfect, max abs diff
 3.9e-7 against the PyTorch reference.
+
+`voxcpm2-audiovae-f16.gguf` (arch `voxcpm2-audiovae`) is independent
+of the two OmniVoice models. Metadata under `voxcpm2.vae.*` records
+the encoder/decoder dimensions, rates, sample-rate boundaries,
+precision, folded-weight flag, checkpoint hash and provenance.
+Tensor prefixes are `vae.enc.*`, `vae.dec.layer.*` and
+`vae.dec.sr_cond.*`. See `docs/VOXCPM2_AUDIOVAE_TOOLING.md` for the
+stable converter/runtime contract.
 
 ## Component architecture
 
@@ -496,7 +519,9 @@ equivalent when missing. Used on the reference transcript when
 
 `audio-postproc.h` is a strict math port of `omnivoice/utils/audio.py`
 plus the relevant `pydub.silence` routines. All public functions take
-and return float32 mono PCM in [-1, 1] at the pipeline rate (24 kHz).
+and return float32 mono PCM in [-1, 1] at the native pipeline rate
+(24 kHz). When the optional AudioVAE is loaded, this post-processing
+runs first and its result is then enhanced to 48 kHz.
 Silence detection runs on int16 samples to match pydub bit-for-bit.
 
 ```
@@ -556,6 +581,30 @@ voice cloning    --ref-wav and --ref-text provided. The reference is
                    sets the target loudness.
 ```
 
+### Optional VoxCPM2 AudioVAE upscaler
+
+The native OmniVoice codec always decodes at 24 kHz. ABI v4 can load a
+separate VAE-only GGUF and apply this buffered post-step:
+
+```
+post-processed 24 kHz mono PCM
+  -> Hann-windowed sinc resample to 16 kHz (torchaudio defaults)
+  -> causal AudioVAE encoder, use deterministic mu latent
+  -> sample-rate-conditioned causal decoder (48 kHz bucket)
+  -> 48 kHz mono PCM
+```
+
+This is learned reconstruction, not conventional interpolation. The
+VAE shares the context's selected GGML backend and backend memory pool,
+but owns its weights and scheduler. The native path passes float PCM
+directly into the VAE, avoiding the PCM16 write/read round trip used by
+the original Python integration. Inputs longer than 6.4 seconds are
+evaluated in bounded chunks of 102,400 samples at 16 kHz with 1.6
+seconds (25,600 samples) of causal history. Historical output is
+discarded at each boundary; the final encoder-hop padding is retained
+exactly as in PyTorch. This avoids graph-size and dispatch limits while
+remaining effectively identical to whole-utterance inference.
+
 ## Public API
 
 Two layers, picked by use case.
@@ -564,7 +613,8 @@ Two layers, picked by use case.
 
 Single-header, plain C99, linkage `extern "C"`. The opaque `ov_context`
 handle aggregates the GGML backend pair, the LM pipeline, the audio
-tokenizer codec, the BPE tokenizer and the voice-design vocabulary.
+tokenizer codec, the optional AudioVAE, the BPE tokenizer and the
+voice-design vocabulary.
 One init, one free, one synthesize call covers the full TTS path.
 Same names, same struct layout, same calling convention from C, C++,
 Python ctypes, Rust bindgen, Go cgo or any other binding generator.
@@ -576,6 +626,7 @@ struct ov_init_params iparams;
 ov_init_default_params(&iparams);
 iparams.model_path = "models/omnivoice-base-Q8_0.gguf";
 iparams.codec_path = "models/omnivoice-tokenizer-F32.gguf";
+iparams.upscaler_path = "models/voxcpm2-audiovae-f16.gguf"; /* optional, ABI v4 */
 
 struct ov_context * ov = ov_init(&iparams);
 
@@ -608,6 +659,22 @@ OV_STATUS_CANCELLED         -5   (cancel callback returned true)
 `ov_tts_params` exposes `cancel` and `cancel_user_data`. The pipeline
 polls between chunks of long-form output, so cancel granularity is
 roughly `chunk_duration_sec` (15 s by default).
+
+`OV_ABI_VERSION` is 4. `ov_init_params.upscaler_path` is the ABI-v4
+tail field: NULL preserves native 24 kHz output; a valid VAE-only GGUF
+is loaded eagerly and makes buffered `ov_synthesize` return 48 kHz in
+`ov_audio.sample_rate`. Passing a future ABI version is rejected.
+Older v1-v3 callers remain compatible because the library reads the
+tail only when `abi_version >= 4`. The DLL keeps the legacy
+`ov_init_default_params` symbol, which writes only the ABI-v3 prefix;
+new source callers are redirected to `ov_init_default_params_v4`, and
+dynamic bindings that use the upscaler must call that v4 symbol explicitly.
+
+Native `ov_tts_params.on_chunk` streaming is deliberately rejected
+when the upscaler is loaded. The AudioVAE currently needs the complete
+buffer (internally bounded/chunked) to preserve causal history and
+correct output boundaries. Bindings that need 48 kHz must call the
+buffered path and stream or enqueue the returned buffer themselves.
 
 The MaskGIT sampler config is flattened directly into `ov_tts_params`
 as seven `mg_*` fields ; `ov_tts_default_params` initialises them to
@@ -668,7 +735,8 @@ Usage: omnivoice-tts --model <gguf> --codec <gguf> [options] -o <out.wav> < text
 Required:
   --model <gguf>          LLM GGUF (F32 / BF16 / Q8_0)
   --codec <gguf>          Codec GGUF (omnivoice-tokenizer-*.gguf)
-  -o <path>               Output WAV (24 kHz mono). '-' streams to stdout (pipe friendly).
+  -o <path>               Output WAV (24 kHz native, 48 kHz with --upscaler).
+                          '-' streams native output to stdout (pipe friendly).
 
 Input:
   stdin                   Target text to synthesise. With -o '-', stdin is read
@@ -688,6 +756,7 @@ Optional:
   --ref-wav <path>        Reference WAV for voice cloning
   --ref-text <path>       Transcript file for the reference (required with --ref-wav / --ref-rvq)
   --ref-rvq <path>        Pre-encoded reference codes from omnivoice-codec (replaces --ref-wav)
+  --upscaler <gguf>       Optional VoxCPM2 AudioVAE GGUF for buffered 48 kHz output
   --seed <int>            Sampling seed (default: -1 for random)
   --steps <int>           MaskGIT decode steps (default: 32, fewer is faster)
   --no-preprocess-prompt  Skip ref-wav silence trim and ref-text terminal punctuation
@@ -726,6 +795,24 @@ hop truncation); the resulting .rvq feeds omnivoice-tts --ref-rvq directly.
 
 The `.rvq` file is a small binary container with shape `[8, T]` int32
 codes plus a header carrying the sample rate and frame rate.
+
+### omnivoice-upscale
+
+Standalone AudioVAE correctness and performance harness:
+
+```
+Usage: omnivoice-upscale --model <voxcpm2-audiovae-f16.gguf> \
+       -i <input.wav> [-o output.wav] [--native-16k]
+```
+
+Without `--native-16k`, input is read as post-processed 24 kHz PCM and
+the CLI performs the production 24 -> 16 -> 48 kHz path. The flag
+accepts an already-resampled 16 kHz float WAV so PyTorch and C++ can
+consume identical samples during layer or seam comparisons. Output is
+48 kHz mono float32 WAV. `omnivoice-tts --upscaler <gguf>` applies the
+same buffered path to full TTS output. Upscaling is intentionally rejected
+for stdout callback streaming, `--stream-by-line`, and SRT timeline assembly;
+`tts-server` also remains a native 24 kHz path for now.
 
 ## Module map
 
@@ -770,6 +857,8 @@ src/
   pipeline-tts.{h,cpp}   Full TTS orchestration, single shot and chunked,
                          plus low-level entries kept available for the
                          debug paths and the cossim test harness
+  pipeline-upscaler.{h,cpp} Optional VoxCPM2 AudioVAE, bounded 24 -> 16
+                         -> 48 kHz enhancement on the selected backend
   omnivoice.{h,cpp}      Public ABI : opaque ov_context handle, plain C99
                          header in extern "C", consumable from C, C++,
                          Python ctypes, Rust bindgen, Go cgo
@@ -777,6 +866,9 @@ src/
 tools/
   omnivoice-tts.cpp    CLI : text to WAV (auto / design / clone)
   omnivoice-codec.cpp  CLI : codes <-> WAV
+  omnivoice-upscale.cpp CLI : standalone AudioVAE parity / benchmark
+  convert-voxcpm2-audiovae.py VAE-only GGUF converter, strict tensor audit
+  dump-voxcpm2-audiovae-reference.py Authoritative PyTorch stage/full dump
   quantize.cpp         GGUF requantizer
   version.cmake        Embeds the git short hash into the binary
 
@@ -865,6 +957,20 @@ between top1 and top2 at those positions), inherent to the mixed cuBLAS
 vs GGML kernel arithmetic. They resorb over the 32 MaskGIT steps so
 the final tokens match bit for bit and decoded audio cosine is
 > 0.9999.
+
+Optional AudioVAE validation used the current 187,868,032-byte mixed
+F16/F32 GGUF and identical float32 16 kHz inputs:
+
+```
+CPU, 1.0 s:     cosine 0.9999996
+Vulkan, 1.0 s:  cosine 0.9999625
+Vulkan, 17.28 s output (warmed): 1.023-1.040 s wall, RTF 0.059-0.060
+Full bounded-chunk seam test versus whole PyTorch: cosine 0.9999720
+```
+
+Lengths matched the PyTorch encoder-hop padding contract exactly.
+These are standalone/native parity and performance tests, not an
+in-game latency or perceptual-quality claim.
 
 ## Glossary
 

@@ -52,7 +52,8 @@ static void print_usage(const char * prog) {
             "Required:\n"
             "  --model <gguf>          LLM GGUF (F32 / BF16 / Q8_0)\n"
             "  --codec <gguf>          Codec GGUF (omnivoice-tokenizer-*.gguf)\n"
-            "  -o <path>               Output WAV (24 kHz mono). '-' streams to stdout (pipe friendly).\n\n"
+            "  -o <path>               Output WAV (24 kHz native, 48 kHz with --upscaler).\n"
+            "                          '-' streams native 24 kHz to stdout (pipe friendly).\n\n"
             "Input:\n"
             "  stdin                   Target text to synthesise. With -o '-', stdin is read\n"
             "                          incrementally and synthesis starts as soon as the first\n"
@@ -63,6 +64,7 @@ static void print_usage(const char * prog) {
             "                          for a cloned voice. Per cue duration comes from the SRT.\n\n"
             "Optional:\n"
             "  --format <fmt>          WAV output format: wav16, wav24, wav32 (default: wav16)\n"
+            "  --upscaler <gguf>       Optional VoxCPM2 AudioVAE GGUF for buffered 48 kHz output\n"
             "  --lang <str>            Language label (default 'None')\n"
             "  --instruct <str>        Style instruction (default 'None')\n"
             "  --duration <sec>        Output duration in seconds (default: estimate from text)\n"
@@ -372,6 +374,7 @@ static int run_srt_dub(ov_context *                 ov,
 // completely untouched.
 static int run_tts_via_ov(const char * model_path,
                           const char * codec_path,
+                          const char * upscaler_path,
                           bool         use_fa,
                           bool         clamp_fp16,
                           const char * ref_wav_path,
@@ -397,6 +400,7 @@ static int run_tts_via_ov(const char * model_path,
     iparams.codec_path = codec_path;
     iparams.use_fa     = use_fa;
     iparams.clamp_fp16 = clamp_fp16;
+    iparams.upscaler_path = upscaler_path;
 
     ov_context * ov = ov_init(&iparams);
     if (!ov) {
@@ -669,6 +673,7 @@ static int main_impl(int argc, char ** argv) {
 
     const char * model_path             = NULL;
     const char * codec_path             = NULL;
+    const char * upscaler_path          = NULL;
     const char * llm_test_in            = NULL;
     bool         maskgit_test_mode      = false;
     const char * prompt_lang            = NULL;
@@ -697,6 +702,8 @@ static int main_impl(int argc, char ** argv) {
             model_path = argv[++i];
         } else if (strcmp(argv[i], "--codec") == 0 && i + 1 < argc) {
             codec_path = argv[++i];
+        } else if (strcmp(argv[i], "--upscaler") == 0 && i + 1 < argc) {
+            upscaler_path = argv[++i];
         } else if (strcmp(argv[i], "--no-fa") == 0) {
             use_fa = false;
         } else if (strcmp(argv[i], "--clamp-fp16") == 0) {
@@ -790,6 +797,10 @@ static int main_impl(int argc, char ** argv) {
         fprintf(stderr, "[CLI] ERROR: --ref-wav / --ref-rvq is only supported in synthesis mode\n");
         return 1;
     }
+    if (upscaler_path && !tts_mode) {
+        fprintf(stderr, "[CLI] ERROR: --upscaler is only supported in synthesis mode\n");
+        return 1;
+    }
     if (srt_path && !tts_mode) {
         fprintf(stderr, "[CLI] ERROR: --srt is only supported in synthesis mode\n");
         return 1;
@@ -806,6 +817,18 @@ static int main_impl(int argc, char ** argv) {
         fprintf(stderr, "[CLI] ERROR: --srt derives per cue duration from the SRT, drop --duration\n");
         return 1;
     }
+    if (upscaler_path && srt_path) {
+        fprintf(stderr, "[CLI] ERROR: --upscaler is not yet supported with --srt timeline assembly\n");
+        return 1;
+    }
+    if (upscaler_path && output_path[0] == '-' && output_path[1] == '\0') {
+        fprintf(stderr, "[CLI] ERROR: --upscaler requires buffered file output (native on_chunk is 24 kHz)\n");
+        return 1;
+    }
+    if (upscaler_path && stream_by_line) {
+        fprintf(stderr, "[CLI] ERROR: --upscaler is incompatible with --stream-by-line\n");
+        return 1;
+    }
 
     // Resolve sampling seed: -1 picks a fresh random seed from std::random_device,
     // any other value is used verbatim for reproducible runs across the maskgit
@@ -816,10 +839,10 @@ static int main_impl(int argc, char ** argv) {
     // TTS mode runs through the OmniVoice handle. Debug modes (--llm-test,
     // --maskgit-test) keep their lower-level init flow below.
     if (tts_mode) {
-        return run_tts_via_ov(model_path, codec_path, use_fa, clamp_fp16, ref_wav_path, ref_rvq_path, ref_text_path,
-                              prompt_lang, prompt_instruct, prompt_duration_sec, prompt_denoise, preprocess_prompt,
-                              chunk_duration_sec, chunk_threshold_sec, stream_by_line, srt_path, mg_steps,
-                              seed_resolved, dump_dir, output_path, wav_fmt);
+        return run_tts_via_ov(model_path, codec_path, upscaler_path, use_fa, clamp_fp16, ref_wav_path, ref_rvq_path,
+                              ref_text_path, prompt_lang, prompt_instruct, prompt_duration_sec, prompt_denoise,
+                              preprocess_prompt, chunk_duration_sec, chunk_threshold_sec, stream_by_line, srt_path,
+                              mg_steps, seed_resolved, dump_dir, output_path, wav_fmt);
     }
 
     BackendPair bp = backend_init("LM");

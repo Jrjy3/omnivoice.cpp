@@ -129,6 +129,7 @@ add_library(omnivoice-core STATIC
     src/omnivoice.cpp
     src/pipeline-codec.cpp
     src/pipeline-tts.cpp
+    src/pipeline-upscaler.cpp
 )
 target_compile_definitions(omnivoice-core PUBLIC OMNIVOICE_STATIC)
 link_ggml_backends(omnivoice-core)
@@ -145,6 +146,7 @@ if(OMNIVOICE_SHARED)
         src/omnivoice.cpp
         src/pipeline-codec.cpp
         src/pipeline-tts.cpp
+        src/pipeline-upscaler.cpp
     )
     target_compile_definitions(omnivoice PRIVATE OMNIVOICE_BUILD)
     set_target_properties(omnivoice PROPERTIES
@@ -163,6 +165,11 @@ link_ggml_backends(quantize)
 add_executable(omnivoice-codec tools/omnivoice-codec.cpp)
 target_link_libraries(omnivoice-codec PRIVATE omnivoice-core)
 link_ggml_backends(omnivoice-codec)
+
+# omnivoice-upscale : standalone AudioVAE correctness/performance harness.
+add_executable(omnivoice-upscale tools/omnivoice-upscale.cpp)
+target_link_libraries(omnivoice-upscale PRIVATE omnivoice-core)
+link_ggml_backends(omnivoice-upscale)
 
 # omnivoice-tts : full TTS pipeline. Grows phase by phase, currently load-only.
 add_executable(omnivoice-tts tools/omnivoice-tts.cpp)
@@ -197,4 +204,3 @@ target_include_directories(test-abi-c PRIVATE
 )
 target_link_libraries(test-abi-c PRIVATE omnivoice-core)
 link_ggml_backends(test-abi-c)
-

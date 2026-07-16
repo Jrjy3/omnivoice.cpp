@@ -16,6 +16,7 @@
 #include "ov-error.h"
 #include "pipeline-codec.h"
 #include "pipeline-tts.h"
+#include "pipeline-upscaler.h"
 #include "version.h"
 #include "voice-design.h"
 
@@ -29,6 +30,10 @@
 #include <string>
 #include <vector>
 
+// The header redirects new source callers to the v4 initializer. This
+// translation unit also defines the legacy v3 binary symbol explicitly.
+#undef ov_init_default_params
+
 // Internal definition of the opaque handle. C++ types are fine here
 // because nothing in this struct ever crosses the public ABI boundary :
 // callers only ever see `struct ov_context *`.
@@ -36,9 +41,11 @@ struct ov_context {
     BackendPair   bp;
     PipelineTTS   pt;
     PipelineCodec pc;
+    PipelineUpscaler upscaler;
     BPETokenizer  tok;
     VoiceDesign   vd;
     bool          codec_loaded;
+    bool          upscaler_loaded;
 };
 
 // Thread-local backing store for ov_last_error(). std::string sized once
@@ -172,11 +179,17 @@ void ov_audio_free(struct ov_audio * a) {
 }
 
 void ov_init_default_params(struct ov_init_params * p) {
-    p->abi_version = OV_ABI_VERSION;
+    p->abi_version = 3;
     p->model_path  = nullptr;
     p->codec_path  = nullptr;
     p->use_fa      = true;
     p->clamp_fp16  = false;
+}
+
+void ov_init_default_params_v4(struct ov_init_params * p) {
+    ov_init_default_params(p);
+    p->abi_version    = OV_ABI_VERSION;
+    p->upscaler_path = nullptr;
 }
 
 void ov_tts_default_params(struct ov_tts_params * p) {
@@ -261,6 +274,16 @@ struct ov_context * ov_init(const struct ov_init_params * params) {
             }
             ov->codec_loaded = true;
         }
+
+        // Tail field added in ABI v4. Older callers pass a shorter struct,
+        // so never read it unless their declared ABI includes the field.
+        const char * upscaler_path = params->abi_version >= 4 ? params->upscaler_path : nullptr;
+        if (upscaler_path && *upscaler_path) {
+            if (!pipeline_upscaler_load(&ov->upscaler, upscaler_path, ov->bp)) {
+                ov_throw("ov_init: pipeline_upscaler_load failed for '%s'", upscaler_path);
+            }
+            ov->upscaler_loaded = true;
+        }
     } catch (const std::exception & e) {
         ov_set_error("%s", e.what());
         ov_log(OV_LOG_ERROR, "[OmniVoice] %s", e.what());
@@ -277,6 +300,9 @@ void ov_free(struct ov_context * ov) {
     }
     if (ov->codec_loaded) {
         pipeline_codec_free(&ov->pc);
+    }
+    if (ov->upscaler_loaded) {
+        pipeline_upscaler_free(&ov->upscaler);
     }
     pipeline_tts_free(&ov->pt);
     backend_release(ov->bp.backend, ov->bp.cpu_backend);
@@ -315,13 +341,48 @@ enum ov_status ov_synthesize(struct ov_context * ov, const struct ov_tts_params 
         ov_log(OV_LOG_ERROR, "[OmniVoice] ov_synthesize requires a codec-loaded handle");
         return OV_STATUS_INVALID_PARAMS;
     }
+    if (ov->upscaler_loaded && params->on_chunk) {
+        ov_set_error("ov_synthesize: native on_chunk streaming is unavailable when upscaler_path is loaded; use buffered synthesis");
+        if (out) {
+            ov_audio_free(out);
+        }
+        ov_log(OV_LOG_ERROR, "[Upscaler] on_chunk streaming cannot emit correctly upscaled chunks yet");
+        return OV_STATUS_INVALID_PARAMS;
+    }
     // Defense in depth: the synthesis path normally reports failures via
     // ov_status return + ov_set_error. A future load-style throw or any
     // std::bad_alloc deep inside the GGML backend is caught here and
     // converted to OV_STATUS_GENERATE_FAILED so an exception never crosses
     // the extern "C" boundary.
     try {
-        return pipeline_tts_synthesize(&ov->pt, &ov->pc, &ov->tok, &ov->vd, params, out);
+        enum ov_status rc = pipeline_tts_synthesize(&ov->pt, &ov->pc, &ov->tok, &ov->vd, params, out);
+        if (rc != OV_STATUS_OK || !ov->upscaler_loaded) {
+            return rc;
+        }
+
+        // pipeline_tts_synthesize has completed every native post-processing
+        // step at 24 kHz. Mirror the torch provider by enhancing only now.
+        std::vector<float> audio_48k =
+            pipeline_upscaler_process(&ov->upscaler, out->samples, out->n_samples);
+        if (audio_48k.empty()) {
+            ov_audio_free(out);
+            ov_set_error("ov_synthesize: VoxCPM2 AudioVAE upscaling failed");
+            return OV_STATUS_GENERATE_FAILED;
+        }
+        size_t bytes = audio_48k.size() * sizeof(float);
+        float * samples = (float *) std::malloc(bytes);
+        if (!samples) {
+            ov_audio_free(out);
+            ov_set_error("ov_synthesize: malloc failed for %zu bytes of 48 kHz output audio", bytes);
+            return OV_STATUS_OOM;
+        }
+        std::memcpy(samples, audio_48k.data(), bytes);
+        ov_audio_free(out);
+        out->samples     = samples;
+        out->n_samples   = (int) audio_48k.size();
+        out->sample_rate = 48000;
+        out->channels    = 1;
+        return OV_STATUS_OK;
     } catch (const std::exception & e) {
         ov_set_error("%s", e.what());
         ov_log(OV_LOG_ERROR, "[OmniVoice] %s", e.what());

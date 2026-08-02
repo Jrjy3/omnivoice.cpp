@@ -84,6 +84,17 @@ def resolve_inputs(input_path: Path, explicit_config: Path | None) -> tuple[Path
     return checkpoint, config
 
 
+def _same_config_value(actual: Any, expected: Any) -> bool:
+    if type(actual) is not type(expected):
+        return False
+    if isinstance(expected, list):
+        return len(actual) == len(expected) and all(
+            _same_config_value(actual_item, expected_item)
+            for actual_item, expected_item in zip(actual, expected)
+        )
+    return actual == expected
+
+
 def load_config(path: Path | None) -> dict[str, Any]:
     config = dict(DEFAULT_CONFIG)
     config["encoder_rates"] = list(DEFAULT_CONFIG["encoder_rates"])
@@ -95,6 +106,8 @@ def load_config(path: Path | None) -> dict[str, Any]:
 
     with path.open("r", encoding="utf-8") as handle:
         raw = json.load(handle)
+    if not isinstance(raw, dict):
+        raise ValueError(f"config in {path} is not an object")
     raw_vae = raw.get("audio_vae_config", raw)
     if not isinstance(raw_vae, dict):
         raise ValueError(f"audio_vae_config in {path} is not an object")
@@ -102,18 +115,17 @@ def load_config(path: Path | None) -> dict[str, Any]:
         if key in raw_vae:
             config[key] = raw_vae[key]
 
-    # The first native runtime targets the official deterministic V2 topology.
-    unsupported = []
-    if not config["depthwise"]:
-        unsupported.append("depthwise=false")
-    if config["use_noise_block"]:
-        unsupported.append("use_noise_block=true")
-    if config["cond_type"] != "scale_bias":
-        unsupported.append(f"cond_type={config['cond_type']!r}")
-    if config["cond_out_layer"]:
-        unsupported.append("cond_out_layer=true")
-    if unsupported:
-        raise ValueError("unsupported AudioVAE topology: " + ", ".join(unsupported))
+    # The native runtime has no dynamic topology path: every recognized
+    # AudioVAE setting is fixed to the official V2 contract. Ignore unrelated
+    # config keys, but reject a recognized override instead of writing a GGUF
+    # that the runtime cannot load.
+    mismatches = []
+    for key, expected in DEFAULT_CONFIG.items():
+        actual = config[key]
+        if not _same_config_value(actual, expected):
+            mismatches.append(f"{key}={actual!r} (expected {expected!r})")
+    if mismatches:
+        raise ValueError("unsupported AudioVAE runtime configuration: " + ", ".join(mismatches))
     return config
 
 

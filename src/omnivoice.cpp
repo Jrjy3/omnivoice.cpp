@@ -30,9 +30,10 @@
 #include <string>
 #include <vector>
 
-// The header redirects new source callers to the v4 initializer. This
-// translation unit also defines the legacy v3 binary symbol explicitly.
+// The header redirects new source callers to the v4 initializers. This
+// translation unit also defines the legacy v3 binary symbols explicitly.
 #undef ov_init_default_params
+#undef ov_tts_default_params
 
 // Internal definition of the opaque handle. C++ types are fine here
 // because nothing in this struct ever crosses the public ABI boundary :
@@ -53,10 +54,18 @@ struct ov_context {
 // reclaims it on thread exit. An empty string means "no error recorded on
 // this thread yet", which ov_last_error() exposes as "".
 static thread_local std::string g_last_error;
+static thread_local bool        g_last_error_is_oom = false;
+
+static void ov_set_oom_error(void) noexcept {
+    // Keep the OOM path allocation-free: assigning to g_last_error could
+    // itself throw and leak a C++ exception across the C ABI.
+    g_last_error_is_oom = true;
+}
 
 void ov_set_error_v(const char * fmt, va_list ap) {
     if (!fmt) {
         g_last_error.clear();
+        g_last_error_is_oom = false;
         return;
     }
     // Two-pass vsnprintf: first call sizes the buffer, second writes the
@@ -67,10 +76,12 @@ void ov_set_error_v(const char * fmt, va_list ap) {
     va_end(ap2);
     if (needed < 0) {
         g_last_error = "ov_set_error: vsnprintf failed";
+        g_last_error_is_oom = false;
         return;
     }
     g_last_error.resize(static_cast<size_t>(needed));
     std::vsnprintf(g_last_error.data(), static_cast<size_t>(needed) + 1, fmt, ap);
+    g_last_error_is_oom = false;
 }
 
 void ov_set_error(const char * fmt, ...) {
@@ -160,9 +171,9 @@ const char * ov_version(void) {
 }
 
 const char * ov_last_error(void) {
-    // c_str() on an empty std::string is guaranteed to point to a NUL
-    // byte by C++11, so callers never have to NULL-check the result.
-    return g_last_error.c_str();
+    // The OOM literal avoids allocating while an exhausted process unwinds.
+    // Otherwise c_str() on an empty std::string still guarantees a NUL byte.
+    return g_last_error_is_oom ? "out of memory" : g_last_error.c_str();
 }
 
 void ov_audio_free(struct ov_audio * a) {
@@ -193,7 +204,7 @@ void ov_init_default_params_v4(struct ov_init_params * p) {
 }
 
 void ov_tts_default_params(struct ov_tts_params * p) {
-    p->abi_version             = OV_ABI_VERSION;
+    p->abi_version             = 3;
     p->text                    = nullptr;
     p->lang                    = nullptr;
     p->instruct                = nullptr;
@@ -222,6 +233,11 @@ void ov_tts_default_params(struct ov_tts_params * p) {
     p->postproc                = true;
 }
 
+void ov_tts_default_params_v4(struct ov_tts_params * p) {
+    ov_tts_default_params(p);
+    p->abi_version = OV_ABI_VERSION;
+}
+
 struct ov_context * ov_init(const struct ov_init_params * params) {
     if (!params || !params->model_path) {
         ov_set_error("ov_init: params or model_path is NULL");
@@ -236,21 +252,27 @@ struct ov_context * ov_init(const struct ov_init_params * params) {
         return nullptr;
     }
 
+    // Tail field added in ABI v4. Validate a supplied empty path before the
+    // backend or any base model is loaded, and never read past a v3 struct.
+    const char * upscaler_path = params->abi_version >= 4 ? params->upscaler_path : nullptr;
+    if (upscaler_path && !*upscaler_path) {
+        ov_set_error("ov_init: upscaler_path must be NULL or a non-empty path");
+        ov_log(OV_LOG_ERROR, "[Upscaler] upscaler_path is an empty string");
+        return nullptr;
+    }
+
     ov_log(OV_LOG_INFO, "[OmniVoice] omnivoice.cpp %s", ov_version());
 
-    // new ov_context() value-initialises every field: POD aggregates
-    // (BackendPair, PipelineTTS, PipelineCodec) are zero-init, std
-    // containers in BPETokenizer construct empty, codec_loaded falls to
-    // false. Only VoiceDesign needs explicit population below.
-    ov_context * ov = new ov_context();
-    voice_design_init(&ov->vd);
+    ov_context * ov = nullptr;
 
-    // The load chain runs inside a try block. Any failure deep in the GGUF
-    // reader, the audio tokenizer load or the LM weight load throws via
-    // ov_throw; the catch funnels every variant into one cleanup via
-    // ov_free, which is idempotent on partial state (NULL-safe sched, NULL
-    // GGUF handles, refcount-correct backend release).
+    // The allocation and load chain run inside one try block. Any failure deep
+    // in the GGUF reader, tokenizer, model load, or C++ allocation funnels into
+    // cleanup via ov_free, which is idempotent on partial state.
     try {
+        // new ov_context() value-initialises POD aggregates and constructs the
+        // tokenizer containers empty. Only VoiceDesign needs explicit fill.
+        ov = new ov_context();
+        voice_design_init(&ov->vd);
         ov->bp = backend_init("LM");
         if (!ov->bp.backend) {
             ov_throw("ov_init: backend_init failed (no GGML backend available)");
@@ -275,15 +297,16 @@ struct ov_context * ov_init(const struct ov_init_params * params) {
             ov->codec_loaded = true;
         }
 
-        // Tail field added in ABI v4. Older callers pass a shorter struct,
-        // so never read it unless their declared ABI includes the field.
-        const char * upscaler_path = params->abi_version >= 4 ? params->upscaler_path : nullptr;
-        if (upscaler_path && *upscaler_path) {
+        if (upscaler_path) {
             if (!pipeline_upscaler_load(&ov->upscaler, upscaler_path, ov->bp)) {
                 ov_throw("ov_init: pipeline_upscaler_load failed for '%s'", upscaler_path);
             }
             ov->upscaler_loaded = true;
         }
+    } catch (const std::bad_alloc &) {
+        ov_set_oom_error();
+        ov_free(ov);
+        return nullptr;
     } catch (const std::exception & e) {
         ov_set_error("%s", e.what());
         ov_log(OV_LOG_ERROR, "[OmniVoice] %s", e.what());
@@ -350,10 +373,8 @@ enum ov_status ov_synthesize(struct ov_context * ov, const struct ov_tts_params 
         return OV_STATUS_INVALID_PARAMS;
     }
     // Defense in depth: the synthesis path normally reports failures via
-    // ov_status return + ov_set_error. A future load-style throw or any
-    // std::bad_alloc deep inside the GGML backend is caught here and
-    // converted to OV_STATUS_GENERATE_FAILED so an exception never crosses
-    // the extern "C" boundary.
+    // ov_status return + ov_set_error. Exceptions are translated at this ABI
+    // boundary, with allocation failure kept distinct from generation failure.
     try {
         enum ov_status rc = pipeline_tts_synthesize(&ov->pt, &ov->pc, &ov->tok, &ov->vd, params, out);
         if (rc != OV_STATUS_OK || !ov->upscaler_loaded) {
@@ -362,8 +383,14 @@ enum ov_status ov_synthesize(struct ov_context * ov, const struct ov_tts_params 
 
         // pipeline_tts_synthesize has completed every native post-processing
         // step at 24 kHz. Mirror the torch provider by enhancing only now.
-        std::vector<float> audio_48k =
-            pipeline_upscaler_process(&ov->upscaler, out->samples, out->n_samples);
+        bool cancelled = false;
+        std::vector<float> audio_48k = pipeline_upscaler_process(
+            &ov->upscaler, out->samples, out->n_samples, params->cancel, params->cancel_user_data, &cancelled);
+        if (cancelled) {
+            ov_audio_free(out);
+            ov_set_error("ov_synthesize: cancelled during VoxCPM2 AudioVAE upscaling");
+            return OV_STATUS_CANCELLED;
+        }
         if (audio_48k.empty()) {
             ov_audio_free(out);
             ov_set_error("ov_synthesize: VoxCPM2 AudioVAE upscaling failed");
@@ -383,6 +410,12 @@ enum ov_status ov_synthesize(struct ov_context * ov, const struct ov_tts_params 
         out->sample_rate = 48000;
         out->channels    = 1;
         return OV_STATUS_OK;
+    } catch (const std::bad_alloc &) {
+        ov_set_oom_error();
+        if (out) {
+            ov_audio_free(out);
+        }
+        return OV_STATUS_OOM;
     } catch (const std::exception & e) {
         ov_set_error("%s", e.what());
         ov_log(OV_LOG_ERROR, "[OmniVoice] %s", e.what());
@@ -488,7 +521,7 @@ enum ov_status ov_extract_voice_ref(struct ov_context *   ov,
                out->ref_T, n_aligned, ref_n_samples);
         return OV_STATUS_OK;
     } catch (const std::bad_alloc &) {
-        ov_set_error("ov_extract_voice_ref: out of memory");
+        ov_set_oom_error();
         ov_voice_ref_free(out);
         return OV_STATUS_OOM;
     } catch (const std::exception & e) {

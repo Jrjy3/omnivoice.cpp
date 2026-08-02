@@ -1,6 +1,8 @@
 cmake_minimum_required(VERSION 3.14)
 project(omnivoice-ggml LANGUAGES C CXX)
 
+include(CTest)
+
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
@@ -184,9 +186,10 @@ link_ggml_backends(tts-server)
 
 # test-abi-c : pure C99 smoke test that locks in the public ABI contract.
 # Compiles omnivoice.h with a C compiler under -Wall -Werror -pedantic and
-# links against the static lib. The test never loads a model ; failure
-# means the public API regressed. Built by default so a regression breaks
-# the main build, not just an opt-in target.
+# links against the public shared library when enabled, otherwise the static
+# core. The test never loads a model; failure means the public API regressed.
+# Built by default so a regression breaks the main build, not just an opt-in
+# target.
 add_executable(test-abi-c tests/abi-c.c)
 set_target_properties(test-abi-c PROPERTIES
     C_STANDARD 99
@@ -202,5 +205,64 @@ target_include_directories(test-abi-c PRIVATE
     ${CMAKE_SOURCE_DIR}/src
     ${CMAKE_BINARY_DIR}
 )
-target_link_libraries(test-abi-c PRIVATE omnivoice-core)
+if(OMNIVOICE_SHARED)
+    target_link_libraries(test-abi-c PRIVATE omnivoice)
+else()
+    target_link_libraries(test-abi-c PRIVATE omnivoice-core)
+endif()
 link_ggml_backends(test-abi-c)
+
+# Frozen-v3 source compatibility canary: compile the historical public header
+# unchanged and link its legacy symbol names against the current library.
+add_executable(test-abi-v3-canary tests/abi-v3-canary.c)
+set_target_properties(test-abi-v3-canary PROPERTIES
+    C_STANDARD 99
+    C_STANDARD_REQUIRED ON
+    C_EXTENSIONS OFF
+)
+if(MSVC)
+    target_compile_options(test-abi-v3-canary PRIVATE /W4 /WX)
+else()
+    target_compile_options(test-abi-v3-canary PRIVATE -Wall -Werror -pedantic)
+endif()
+target_include_directories(test-abi-v3-canary PRIVATE
+    ${CMAKE_SOURCE_DIR}/tests
+    ${CMAKE_BINARY_DIR}
+)
+if(OMNIVOICE_SHARED)
+    target_link_libraries(test-abi-v3-canary PRIVATE omnivoice)
+else()
+    target_link_libraries(test-abi-v3-canary PRIVATE omnivoice-core)
+endif()
+link_ggml_backends(test-abi-v3-canary)
+
+if(BUILD_TESTING)
+    # Metadata checks use an in-memory GGUF context, so malformed scalar and
+    # array types are covered without model files or backend initialization.
+    add_executable(test-gguf-metadata tests/gguf-metadata.cpp)
+    target_link_libraries(test-gguf-metadata PRIVATE omnivoice-core)
+    link_ggml_backends(test-gguf-metadata)
+
+    # Loads only the standalone AudioVAE and exercises pre-work, pre-chunk, and
+    # post-chunk cancellation. No OmniVoice base or codec model is required.
+    add_executable(test-upscaler-cancel tests/upscaler-cancel.cpp)
+    target_link_libraries(test-upscaler-cancel PRIVATE omnivoice-core)
+    link_ggml_backends(test-upscaler-cancel)
+
+    add_test(NAME abi-current COMMAND test-abi-c)
+    add_test(NAME abi-v3-canary COMMAND test-abi-v3-canary)
+    add_test(NAME gguf-metadata COMMAND test-gguf-metadata)
+
+    find_package(Python3 COMPONENTS Interpreter QUIET)
+    if(Python3_Interpreter_FOUND)
+        add_test(NAME converter-config
+                 COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tests/converter-config.py")
+    endif()
+
+    set(OMNIVOICE_AUDIOVAE_TEST_MODEL "" CACHE FILEPATH
+        "Optional AudioVAE GGUF used to register the model-backed cancellation test")
+    if(OMNIVOICE_AUDIOVAE_TEST_MODEL AND EXISTS "${OMNIVOICE_AUDIOVAE_TEST_MODEL}")
+        add_test(NAME upscaler-cancel
+                 COMMAND test-upscaler-cancel "${OMNIVOICE_AUDIOVAE_TEST_MODEL}")
+    endif()
+endif()

@@ -408,38 +408,70 @@ static struct ggml_tensor * gf_load_pair_fused(WeightCtx *         wctx,
     return fused;
 }
 
+static int64_t gf_find_typed_key(const GGUFModel & gf, const char * key, enum gguf_type expected) {
+    int64_t idx = gguf_find_key(gf.gguf, key);
+    if (idx >= 0) {
+        enum gguf_type actual = gguf_get_kv_type(gf.gguf, idx);
+        if (actual != expected) {
+            ov_throw("[GGUF] metadata '%s' has type %s, expected %s", key, gguf_type_name(actual),
+                     gguf_type_name(expected));
+        }
+    }
+    return idx;
+}
+
 // Read a uint32 KV value (returns 0 if not found)
 static uint32_t gf_get_u32(const GGUFModel & gf, const char * key) {
-    int64_t idx = gguf_find_key(gf.gguf, key);
-    if (idx < 0) {
-        return 0;
-    }
-    return gguf_get_val_u32(gf.gguf, idx);
+    int64_t idx = gf_find_typed_key(gf, key, GGUF_TYPE_UINT32);
+    return idx < 0 ? 0 : gguf_get_val_u32(gf.gguf, idx);
 }
 
 // Read a float32 KV value (returns 0 if not found)
 static float gf_get_f32(const GGUFModel & gf, const char * key) {
-    int64_t idx = gguf_find_key(gf.gguf, key);
-    if (idx < 0) {
-        return 0.0f;
-    }
-    return gguf_get_val_f32(gf.gguf, idx);
+    int64_t idx = gf_find_typed_key(gf, key, GGUF_TYPE_FLOAT32);
+    return idx < 0 ? 0.0f : gguf_get_val_f32(gf.gguf, idx);
 }
 
 // Read a string KV value (returns "" if not found)
 static const char * gf_get_str(const GGUFModel & gf, const char * key) {
-    int64_t idx = gguf_find_key(gf.gguf, key);
-    if (idx < 0) {
-        return "";
-    }
-    return gguf_get_val_str(gf.gguf, idx);
+    int64_t idx = gf_find_typed_key(gf, key, GGUF_TYPE_STRING);
+    return idx < 0 ? "" : gguf_get_val_str(gf.gguf, idx);
 }
 
 // Read a bool KV value (returns false if not found)
 static bool gf_get_bool(const GGUFModel & gf, const char * key) {
+    int64_t idx = gf_find_typed_key(gf, key, GGUF_TYPE_BOOL);
+    return idx < 0 ? false : gguf_get_val_bool(gf.gguf, idx);
+}
+
+// Validate an integer array without calling any array accessor until the KV
+// and element types are known. Both signed and unsigned 32-bit GGUF arrays
+// are accepted because converters in the wild emit either representation.
+static bool gf_array_equals_i32(const GGUFModel & gf,
+                                const char * key,
+                                const int * expected,
+                                size_t expected_count) {
     int64_t idx = gguf_find_key(gf.gguf, key);
-    if (idx < 0) {
+    if (idx < 0 || gguf_get_kv_type(gf.gguf, idx) != GGUF_TYPE_ARRAY) {
         return false;
     }
-    return gguf_get_val_bool(gf.gguf, idx);
+    enum gguf_type type = gguf_get_arr_type(gf.gguf, idx);
+    if (type != GGUF_TYPE_UINT32 && type != GGUF_TYPE_INT32) {
+        return false;
+    }
+    if (gguf_get_arr_n(gf.gguf, idx) != expected_count) {
+        return false;
+    }
+    const void * data = gguf_get_arr_data(gf.gguf, idx);
+    if (!data && expected_count != 0) {
+        return false;
+    }
+    for (size_t i = 0; i < expected_count; i++) {
+        int64_t value = type == GGUF_TYPE_UINT32 ? (int64_t) ((const uint32_t *) data)[i]
+                                                 : (int64_t) ((const int32_t *) data)[i];
+        if (value != expected[i]) {
+            return false;
+        }
+    }
+    return true;
 }

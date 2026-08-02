@@ -125,33 +125,6 @@ static enum ggml_type conv_weight_type(const GGUFModel & gf, const std::string &
     return type;
 }
 
-static bool metadata_array_equals(const GGUFModel & gf,
-                                  const char * key,
-                                  const int * expected,
-                                  size_t expected_count) {
-    int64_t id = gguf_find_key(gf.gguf, key);
-    if (id < 0 || gguf_get_kv_type(gf.gguf, id) != GGUF_TYPE_ARRAY ||
-        gguf_get_arr_n(gf.gguf, id) != expected_count) {
-        return false;
-    }
-    enum gguf_type type = gguf_get_arr_type(gf.gguf, id);
-    const void * data   = gguf_get_arr_data(gf.gguf, id);
-    for (size_t i = 0; i < expected_count; i++) {
-        int value;
-        if (type == GGUF_TYPE_UINT32) {
-            value = (int) ((const uint32_t *) data)[i];
-        } else if (type == GGUF_TYPE_INT32) {
-            value = (int) ((const int32_t *) data)[i];
-        } else {
-            return false;
-        }
-        if (value != expected[i]) {
-            return false;
-        }
-    }
-    return true;
-}
-
 static UpscalerConv alloc_conv(struct ggml_context * ctx,
                                const GGUFModel & gf,
                                const std::string & prefix,
@@ -378,6 +351,16 @@ static struct ggml_tensor * res_unit_graph(struct ggml_context * ctx,
     return ggml_add(ctx, skip, x);
 }
 
+static bool cancellation_requested(ov_cancel_cb cancel, void * user_data, bool * cancelled) {
+    if (cancel && cancel(user_data)) {
+        if (cancelled) {
+            *cancelled = true;
+        }
+        return true;
+    }
+    return false;
+}
+
 static std::vector<float> run_chunk(PipelineUpscaler * pu, const float * pcm_16k, int n_samples) {
     if (!pu || !pu->loaded || !pcm_16k || n_samples <= 0) {
         return {};
@@ -507,9 +490,9 @@ bool pipeline_upscaler_load(PipelineUpscaler * pu, const char * gguf_path, Backe
                      encoder_dim, latent_dim, decoder_dim, cond_dim, in_rate, out_rate);
         }
         static const int sr_boundaries[3] = { 20000, 30000, 40000 };
-        if (!metadata_array_equals(gf, "voxcpm2.vae.encoder_rates", kEncoderRates, 4) ||
-            !metadata_array_equals(gf, "voxcpm2.vae.decoder_rates", kDecoderRates, 6) ||
-            !metadata_array_equals(gf, "voxcpm2.vae.sr_bin_boundaries", sr_boundaries, 3)) {
+        if (!gf_array_equals_i32(gf, "voxcpm2.vae.encoder_rates", kEncoderRates, 4) ||
+            !gf_array_equals_i32(gf, "voxcpm2.vae.decoder_rates", kDecoderRates, 6) ||
+            !gf_array_equals_i32(gf, "voxcpm2.vae.sr_bin_boundaries", sr_boundaries, 3)) {
             ov_throw("[Upscaler] unsupported AudioVAE rate arrays or SR bucket boundaries");
         }
 
@@ -628,9 +611,20 @@ void pipeline_upscaler_free(PipelineUpscaler * pu) {
     *pu = {};
 }
 
-std::vector<float> pipeline_upscaler_process_16k(PipelineUpscaler * pu, const float * pcm_16k, int n_16k) {
+std::vector<float> pipeline_upscaler_process_16k(PipelineUpscaler * pu,
+                                                 const float * pcm_16k,
+                                                 int n_16k,
+                                                 ov_cancel_cb cancel,
+                                                 void * cancel_user_data,
+                                                 bool * cancelled) {
+    if (cancelled) {
+        *cancelled = false;
+    }
     if (!pu || !pu->loaded || !pcm_16k || n_16k <= 0) {
         ov_log(OV_LOG_ERROR, "[Upscaler] process called without a loaded model or audio");
+        return {};
+    }
+    if (cancellation_requested(cancel, cancel_user_data, cancelled)) {
         return {};
     }
 
@@ -639,10 +633,16 @@ std::vector<float> pipeline_upscaler_process_16k(PipelineUpscaler * pu, const fl
     out.reserve((size_t) target_48k);
 
     for (int start = 0; start < n_16k; start += kChunkPayload16k) {
+        if (cancellation_requested(cancel, cancel_user_data, cancelled)) {
+            return {};
+        }
         int seg_start = std::max(0, start - kChunkHistory16k);
         int seg_end   = std::min(n_16k, start + kChunkPayload16k);
         int seg_n     = seg_end - seg_start;
         std::vector<float> chunk = run_chunk(pu, pcm_16k + seg_start, seg_n);
+        if (cancellation_requested(cancel, cancel_user_data, cancelled)) {
+            return {};
+        }
         if (chunk.empty()) {
             return {};
         }
@@ -664,9 +664,20 @@ std::vector<float> pipeline_upscaler_process_16k(PipelineUpscaler * pu, const fl
     return out;
 }
 
-std::vector<float> pipeline_upscaler_process(PipelineUpscaler * pu, const float * pcm_24k, int n_samples) {
+std::vector<float> pipeline_upscaler_process(PipelineUpscaler * pu,
+                                             const float * pcm_24k,
+                                             int n_samples,
+                                             ov_cancel_cb cancel,
+                                             void * cancel_user_data,
+                                             bool * cancelled) {
+    if (cancelled) {
+        *cancelled = false;
+    }
     if (!pu || !pu->loaded || !pcm_24k || n_samples <= 0) {
         ov_log(OV_LOG_ERROR, "[Upscaler] process called without a loaded model or audio");
+        return {};
+    }
+    if (cancellation_requested(cancel, cancel_user_data, cancelled)) {
         return {};
     }
     int n_16k = 0;
@@ -677,7 +688,8 @@ std::vector<float> pipeline_upscaler_process(PipelineUpscaler * pu, const float 
         return {};
     }
     auto t0 = std::chrono::steady_clock::now();
-    std::vector<float> out = pipeline_upscaler_process_16k(pu, resampled.get(), n_16k);
+    std::vector<float> out =
+        pipeline_upscaler_process_16k(pu, resampled.get(), n_16k, cancel, cancel_user_data, cancelled);
     auto t1 = std::chrono::steady_clock::now();
     if (!out.empty()) {
         double elapsed = std::chrono::duration<double>(t1 - t0).count();

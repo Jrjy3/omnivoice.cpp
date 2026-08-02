@@ -54,7 +54,7 @@ extern "C" {
 // There is no separate semver triple. The runtime build identity is the
 // git short hash + commit date string returned by ov_version(); for
 // binding compat checks, OV_ABI_VERSION is the only number that matters.
-#define OV_ABI_VERSION 4
+#define OV_ABI_VERSION 3
 
 // Returns a static string of the form "<git-hash> (<date>)" identifying
 // the exact commit this binary was built from. Safe to call from any
@@ -89,7 +89,7 @@ OV_API const char * ov_last_error(void);
 struct ov_audio {
     float * samples;      // mono PCM, malloc-allocated
     int     n_samples;    // length in samples
-    int     sample_rate;  // 24000 native, 48000 when AudioVAE is loaded
+    int     sample_rate;  // 24000 for OmniVoice
     int     channels;     // 1 (mono)
 };
 
@@ -104,9 +104,7 @@ struct ov_context;
 // codec_path is NULL the codec module is skipped and ov_synthesize fails
 // immediately with OV_STATUS_INVALID_PARAMS. use_fa enables flash
 // attention when a GPU backend is present; clamp_fp16 guards FP16
-// matmul accumulation on sub-Ampere CUDA. upscaler_path is optional: NULL
-// preserves native 24 kHz output; a supplied VAE-only GGUF is eagerly loaded
-// and makes buffered synthesis return 48 kHz. abi_version stays first so a
+// matmul accumulation on sub-Ampere CUDA. abi_version stays first so a
 // future struct growth keeps reading the version field at offset 0.
 struct ov_init_params {
     int          abi_version;
@@ -114,18 +112,11 @@ struct ov_init_params {
     const char * codec_path;
     bool         use_fa;
     bool         clamp_fp16;
-    const char * upscaler_path;
 };
 
-// Legacy ABI-v3 initializer symbol. It writes only the v3 prefix and sets
-// abi_version=3, keeping an old dynamically-linked caller's smaller struct
-// safe if it loads a v4 library.
+// Initialise to the standard defaults: codec_path NULL (caller must set
+// it for synthesis), use_fa true, clamp_fp16 false.
 OV_API void ov_init_default_params(struct ov_init_params * p);
-
-// ABI-v4 initializer: standard defaults plus upscaler_path NULL. New source
-// callers are redirected here while the old binary symbol remains available.
-OV_API void ov_init_default_params_v4(struct ov_init_params * p);
-#define ov_init_default_params ov_init_default_params_v4
 
 // Allocate every module described by params. Returns NULL on any failure
 // after releasing whatever it has allocated so far. The returned handle
@@ -147,8 +138,7 @@ typedef bool (*ov_cancel_cb)(void * user_data);
 // of ov_synthesize. Returning false aborts the synthesis with
 // OV_STATUS_CANCELLED, identical to the ov_cancel_cb behaviour. The samples
 // pointer is mono float PCM at the codec sample rate; valid only for the
-// duration of the call. Contexts with upscaler_path loaded reject this mode
-// because their correct output rate is 48 kHz. user_data is forwarded verbatim.
+// duration of the call. user_data is forwarded verbatim from on_chunk_user_data.
 //
 // Bit perfect against the buffered path for voice cloning. For voice design
 // (no reference) the streaming pipeline skips peak / 0.5 normalisation since
@@ -259,23 +249,18 @@ struct ov_tts_params {
     bool postproc;
 };
 
-// Legacy ABI-v3 initializer symbol. It sets abi_version=3 so callers using
-// the frozen v3 header keep reporting the ABI they were compiled against.
+// Initialise to the standard defaults. Strings NULL, T_override 0,
+// chunk_duration_sec 15, chunk_threshold_sec 30, denoise true,
+// preprocess_prompt true, MaskGIT defaults as above, every reference
+// pointer NULL, dump_dir NULL, cancel NULL, postproc true.
 OV_API void ov_tts_default_params(struct ov_tts_params * p);
-
-// ABI-v4 initializer. New source callers are redirected here, symmetrical
-// with ov_init_default_params_v4, while the v3 binary symbol remains stable.
-OV_API void ov_tts_default_params_v4(struct ov_tts_params * p);
-#define ov_tts_default_params ov_tts_default_params_v4
 
 // Run the full TTS synthesis. Resolves the instruct against the bundled
 // VoiceDesign vocabulary, picks between single-shot, chunked auto-voice
 // and voice-cloning paths from the params struct, and fills `out` with
-// mono float PCM at 24 kHz natively or 48 kHz when upscaler_path is loaded.
-// Native on_chunk streaming is rejected for an upscaler-enabled context
-// until stateful 48 kHz streaming is implemented. Returns OV_STATUS_OK on
-// success; on failure returns a negative status and leaves `out` empty.
-// Requires a codec-loaded handle.
+// mono float PCM at 24 kHz. Returns OV_STATUS_OK on success; on any
+// failure returns a negative ov_status describing the cause and leaves
+// `out` empty. Requires a codec-loaded handle.
 OV_API enum ov_status ov_synthesize(struct ov_context * ov, const struct ov_tts_params * params, struct ov_audio * out);
 
 // Convert a duration in seconds to a frame count using the bundled codec

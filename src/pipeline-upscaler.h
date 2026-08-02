@@ -8,6 +8,7 @@
 
 #include "backend.h"
 #include "gguf-weights.h"
+#include "omnivoice.h"
 
 #include <vector>
 
@@ -76,9 +77,21 @@ void pipeline_upscaler_free(PipelineUpscaler * pu);
 
 // Input is post-processed OmniVoice mono PCM at 24 kHz.  The implementation
 // performs the same 24 -> 16 kHz sinc resample as the torch path, encodes mu,
-// and decodes with the 48 kHz SR-conditioning bucket.  Empty means failure.
-std::vector<float> pipeline_upscaler_process(PipelineUpscaler * pu, const float * pcm_24k, int n_samples);
+// and decodes with the 48 kHz SR-conditioning bucket.  Empty means failure or
+// cancellation; cancelled is set only for the latter. CLI callers omit the
+// optional callback arguments and remain uncancelled.
+std::vector<float> pipeline_upscaler_process(PipelineUpscaler * pu,
+                                             const float * pcm_24k,
+                                             int n_samples,
+                                             ov_cancel_cb cancel = nullptr,
+                                             void * cancel_user_data = nullptr,
+                                             bool * cancelled = nullptr);
 
 // Test/parity entry: bypass the 24 -> 16 kHz resampler and run AudioVAE on
 // already-resampled mono PCM. Not part of the public C ABI.
-std::vector<float> pipeline_upscaler_process_16k(PipelineUpscaler * pu, const float * pcm_16k, int n_samples);
+std::vector<float> pipeline_upscaler_process_16k(PipelineUpscaler * pu,
+                                                 const float * pcm_16k,
+                                                 int n_samples,
+                                                 ov_cancel_cb cancel = nullptr,
+                                                 void * cancel_user_data = nullptr,
+                                                 bool * cancelled = nullptr);

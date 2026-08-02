@@ -60,13 +60,21 @@ int main(void) {
     struct ov_tts_params params;
     ov_tts_default_params(&params);
 
+    /* Touch the explicit v4 entry points as well as the current-header macro
+     * redirects above, so both source and binary names are link-checked. */
+    struct ov_init_params explicit_v4_iparams;
+    struct ov_tts_params explicit_v4_params;
+    ov_init_default_params_v4(&explicit_v4_iparams);
+    ov_tts_default_params_v4(&explicit_v4_params);
+
     /* Sanity-check a few default values, including the new abi_version. */
     if (params.mg_num_step != 32 || params.chunk_duration_sec <= 0.0f) {
         fprintf(stderr, "[Probe] default values do not match\n");
         return 1;
     }
-    if (iparams.abi_version != OV_ABI_VERSION || params.abi_version != OV_ABI_VERSION) {
-        fprintf(stderr, "[Probe] abi_version not set by ov_*_default_params\n");
+    if (iparams.abi_version != OV_ABI_VERSION || params.abi_version != OV_ABI_VERSION ||
+        explicit_v4_iparams.abi_version != OV_ABI_VERSION || explicit_v4_params.abi_version != OV_ABI_VERSION) {
+        fprintf(stderr, "[Probe] ABI-v4 defaults did not report the current version\n");
         return 1;
     }
     if (iparams.upscaler_path != NULL) {
@@ -124,6 +132,17 @@ int main(void) {
     }
     printf("[Probe] ov_log_set routed %d line(s), last: '%s'\n", g_log_lines, g_last_log_msg);
     printf("[Probe] ov_last_error reads '%s'\n", err);
+
+    /* A non-NULL empty upscaler path is invalid and must be rejected before
+     * the irrelevant base-model path reaches backend/model loading. */
+    struct ov_init_params empty_upscaler;
+    ov_init_default_params(&empty_upscaler);
+    empty_upscaler.model_path = "must-not-be-opened.gguf";
+    empty_upscaler.upscaler_path = "";
+    if (ov_init(&empty_upscaler) != NULL || strstr(ov_last_error(), "upscaler_path") == NULL) {
+        fprintf(stderr, "[Probe] empty upscaler_path was not rejected up front\n");
+        return 10;
+    }
 
     /* abi_version validation : a struct claiming a future ABI must be
      * rejected up front, before any allocation. */

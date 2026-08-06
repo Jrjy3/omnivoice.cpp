@@ -3,17 +3,19 @@ param(
     [Parameter(Mandatory = $true)]
     [string]$BuildDirectory,
 
+    [string]$Version = "1.1.0",
+
     [string]$OutputPath
 )
 
 $ErrorActionPreference = "Stop"
 $repositoryRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 $buildRoot = (Resolve-Path $BuildDirectory).Path
-$manifestPath = Join-Path $repositoryRoot "packaging\sonorus-runtime-v1.0.0.json"
+$manifestPath = Join-Path $repositoryRoot "packaging\sonorus-runtime-v$Version.json"
 $manifest = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json
 if (-not $OutputPath) {
     $OutputPath = Join-Path $repositoryRoot (
-        "dist\omnivoice-runtime-windows-x64-avx2-vulkan-v1.0.0.zip"
+        "dist\omnivoice-runtime-windows-x64-avx2-vulkan-v$Version.zip"
     )
 }
 $outputFullPath = [System.IO.Path]::GetFullPath($OutputPath)

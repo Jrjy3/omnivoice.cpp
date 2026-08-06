@@ -1,0 +1,47 @@
+{
+  "schema_version": 1,
+  "version": "1.1.0",
+  "platform": "windows-x64",
+  "cpu_baseline": "AVX2",
+  "gpu_backend": "Vulkan",
+  "omnivoice_commit": "ec6b9f266ffd536aaed4db9922102dd435e30553",
+  "ggml_commit": "9fcaed18adc9f6ecc6ef1c8e58e2285e893d8319",
+  "abi_version": 5,
+  "cmake": {
+    "GGML_NATIVE": false,
+    "GGML_AVX": true,
+    "GGML_AVX2": true,
+    "GGML_AVX512": false,
+    "GGML_AVX512_BF16": false,
+    "GGML_AVX512_VBMI": false,
+    "GGML_AVX512_VNNI": false,
+    "GGML_AVX_VNNI": false,
+    "GGML_BMI2": true,
+    "GGML_F16C": true,
+    "GGML_FMA": true,
+    "GGML_VULKAN": true,
+    "OMNIVOICE_SHARED": true
+  },
+  "files": {
+    "ggml-base.dll": {
+      "size": 666112,
+      "sha256": "d11206789750a5dbb3a1342c5d8b42fa68a36c23386b7e8d6847b800e5a0b441"
+    },
+    "ggml-cpu.dll": {
+      "size": 812032,
+      "sha256": "91446374398d2d86c3440a5d4c9089bbf239568317faa1b57edd098db074d97a"
+    },
+    "ggml-vulkan.dll": {
+      "size": 50652160,
+      "sha256": "a3b6d5da334555c9e6d4a3fd9a8d2770a81586eb0e6216a60a58c4cbb1032079"
+    },
+    "ggml.dll": {
+      "size": 68608,
+      "sha256": "d792fc740e16ade5c9486df2a3f6eb4d33f50442bb820773d4a651353d55308c"
+    },
+    "omnivoice.dll": {
+      "size": 401408,
+      "sha256": "7de3ca56fc60f6d40b6843c23205ff0f21c19efae090fbf05fe79fb1461035c5"
+    }
+  }
+}

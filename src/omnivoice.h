@@ -287,10 +287,14 @@ struct ov_tts_params {
 // the frozen v3 header keep reporting the ABI they were compiled against.
 OV_API void ov_tts_default_params(struct ov_tts_params * p);
 
-// ABI-v4 initializer. New source callers are redirected here, symmetrical
-// with ov_init_default_params_v4, while the v3 binary symbol remains stable.
+// ABI-v4 initializer, symmetrical with ov_init_default_params_v4. Retained as
+// a binary symbol while the v3 symbol also remains stable.
 OV_API void ov_tts_default_params_v4(struct ov_tts_params * p);
-#define ov_tts_default_params ov_tts_default_params_v4
+
+// ABI-v5 initializer. The synthesis struct did not grow in v5; this exists so
+// every vN initializer reports exactly N, which is what the ABI probe checks.
+OV_API void ov_tts_default_params_v5(struct ov_tts_params * p);
+#define ov_tts_default_params ov_tts_default_params_v5
 
 // Run the full TTS synthesis. Resolves the instruct against the bundled
 // VoiceDesign vocabulary, picks between single-shot, chunked auto-voice

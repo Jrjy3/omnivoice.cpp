@@ -241,6 +241,11 @@ void ov_tts_default_params(struct ov_tts_params * p) {
 
 void ov_tts_default_params_v4(struct ov_tts_params * p) {
     ov_tts_default_params(p);
+    p->abi_version = 4;
+}
+
+void ov_tts_default_params_v5(struct ov_tts_params * p) {
+    ov_tts_default_params_v4(p);
     p->abi_version = OV_ABI_VERSION;
 }
 

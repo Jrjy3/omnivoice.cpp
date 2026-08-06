@@ -65,9 +65,11 @@ int main(void) {
     struct ov_init_params explicit_v4_iparams;
     struct ov_init_params explicit_v5_iparams;
     struct ov_tts_params explicit_v4_params;
+    struct ov_tts_params explicit_v5_params;
     ov_init_default_params_v4(&explicit_v4_iparams);
     ov_init_default_params_v5(&explicit_v5_iparams);
     ov_tts_default_params_v4(&explicit_v4_params);
+    ov_tts_default_params_v5(&explicit_v5_params);
 
     /* Sanity-check a few default values, including the new abi_version. */
     if (params.mg_num_step != 32 || params.chunk_duration_sec <= 0.0f) {
@@ -75,13 +77,14 @@ int main(void) {
         return 1;
     }
     if (iparams.abi_version != OV_ABI_VERSION || params.abi_version != OV_ABI_VERSION ||
-        explicit_v5_iparams.abi_version != OV_ABI_VERSION || explicit_v4_params.abi_version != OV_ABI_VERSION) {
+        explicit_v5_iparams.abi_version != OV_ABI_VERSION || explicit_v5_params.abi_version != OV_ABI_VERSION) {
         fprintf(stderr, "[Probe] ABI-v5 defaults did not report the current version\n");
         return 1;
     }
-    /* The v4 initializer must keep claiming 4: a caller built against the v4
-     * header has no encoder_mode field for ov_init to read. */
-    if (explicit_v4_iparams.abi_version != 4) {
+    /* Every vN initializer must report exactly N. A caller built against the
+     * v4 header has no encoder_mode field for ov_init to read, so v4 claiming
+     * the current version would make ov_init read past the end of its struct. */
+    if (explicit_v4_iparams.abi_version != 4 || explicit_v4_params.abi_version != 4) {
         fprintf(stderr, "[Probe] ABI-v4 defaults did not report version 4\n");
         return 1;
     }

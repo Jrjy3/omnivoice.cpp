@@ -41,7 +41,9 @@ static void print_usage(const char * prog) {
             "  --model <gguf>          Codec GGUF (omnivoice-tokenizer-*.gguf)\n"
             "  -i <path>               Input. WAV -> encode, .rvq -> decode\n\n"
             "Optional:\n"
-            "  --format <fmt>          WAV output format: wav16, wav24, wav32 (default: wav16)\n\n"
+            "  --format <fmt>          WAV output format: wav16, wav24, wav32 (default: wav16)\n"
+            "  --encoder-mode <mode>   Voice-encoder residency: eager, lazy, ondemand (default: eager)\n"
+            "  --verify-reload         Re-encode after releasing the voice encoder and compare\n\n"
             "Output is auto-named next to input : clip.wav -> clip.rvq, clip.rvq -> clip.wav.\n"
             "Encode applies the TTS reference preprocessing (RMS auto-gain, silence trim,\n"
             "hop truncation); the resulting .rvq feeds omnivoice-tts --ref-rvq directly.\n",
@@ -75,12 +77,28 @@ int main_impl(int argc, char ** argv) {
         return 0;
     }
 
-    const char * model_path = NULL;
-    const char * input_path = NULL;
-    WavFormat    wav_fmt    = WAV_S16;
+    const char *     model_path   = NULL;
+    const char *     input_path   = NULL;
+    WavFormat        wav_fmt      = WAV_S16;
+    CodecEncoderMode encoder_mode  = CODEC_ENCODER_EAGER;
+    bool             verify_reload = false;
 
     for (int i = 1; i < argc; i++) {
-        if (strcmp(argv[i], "--model") == 0 && i + 1 < argc) {
+        if (strcmp(argv[i], "--verify-reload") == 0) {
+            verify_reload = true;
+        } else if (strcmp(argv[i], "--encoder-mode") == 0 && i + 1 < argc) {
+            const char * m = argv[++i];
+            if (strcmp(m, "eager") == 0) {
+                encoder_mode = CODEC_ENCODER_EAGER;
+            } else if (strcmp(m, "lazy") == 0) {
+                encoder_mode = CODEC_ENCODER_LAZY;
+            } else if (strcmp(m, "ondemand") == 0) {
+                encoder_mode = CODEC_ENCODER_ON_DEMAND;
+            } else {
+                fprintf(stderr, "[CLI] ERROR: unknown encoder mode: %s (eager|lazy|ondemand)\n", m);
+                return 1;
+            }
+        } else if (strcmp(argv[i], "--model") == 0 && i + 1 < argc) {
             model_path = argv[++i];
         } else if (strcmp(argv[i], "-i") == 0 && i + 1 < argc) {
             input_path = argv[++i];
@@ -119,7 +137,7 @@ int main_impl(int argc, char ** argv) {
     }
 
     PipelineCodec pc = {};
-    if (!pipeline_codec_load(&pc, model_path, bp)) {
+    if (!pipeline_codec_load(&pc, model_path, bp, encoder_mode)) {
         backend_release(bp.backend, bp.cpu_backend);
         return 1;
     }
@@ -150,7 +168,22 @@ int main_impl(int argc, char ** argv) {
                 rc = 1;
             } else {
                 std::vector<int32_t> codes = pipeline_codec_encode(&pc, buf.data(), n_aligned);
-                if (codes.empty()) {
+                // Encoder residency must not change the codes. Re-encoding
+                // after an explicit release exercises the unload/reload path
+                // that ON_DEMAND takes between every pair of encodes.
+                if (verify_reload && !codes.empty()) {
+                    pipeline_codec_encoder_unload(&pc);
+                    const std::vector<int32_t> again = pipeline_codec_encode(&pc, buf.data(), n_aligned);
+                    if (again != codes) {
+                        fprintf(stderr, "[OmniVoice-Codec] FATAL: re-encode after encoder reload differs\n");
+                        rc = 1;
+                    } else {
+                        fprintf(stderr, "[OmniVoice-Codec] Verify: re-encode after encoder reload is identical\n");
+                    }
+                }
+                if (rc != 0) {
+                    // reload verification already reported the failure
+                } else if (codes.empty()) {
                     fprintf(stderr, "[OmniVoice-Codec] FATAL: encode failed\n");
                     rc = 1;
                 } else if (!rvq_write_file(out_str.c_str(), codes, RVQ_CODE_BITS)) {

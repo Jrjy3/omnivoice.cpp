@@ -199,8 +199,14 @@ void ov_init_default_params(struct ov_init_params * p) {
 
 void ov_init_default_params_v4(struct ov_init_params * p) {
     ov_init_default_params(p);
-    p->abi_version    = OV_ABI_VERSION;
+    p->abi_version   = 4;
     p->upscaler_path = nullptr;
+}
+
+void ov_init_default_params_v5(struct ov_init_params * p) {
+    ov_init_default_params_v4(p);
+    p->abi_version  = OV_ABI_VERSION;
+    p->encoder_mode = OV_ENCODER_EAGER;
 }
 
 void ov_tts_default_params(struct ov_tts_params * p) {
@@ -255,6 +261,20 @@ struct ov_context * ov_init(const struct ov_init_params * params) {
     // Tail field added in ABI v4. Validate a supplied empty path before the
     // backend or any base model is loaded, and never read past a v3 struct.
     const char * upscaler_path = params->abi_version >= 4 ? params->upscaler_path : nullptr;
+
+    // Tail field added in ABI v5. Older callers keep the pre-v5 contract of an
+    // always-resident voice encoder; an out-of-range value is rejected rather
+    // than silently reinterpreted.
+    const ov_encoder_mode requested_mode = params->abi_version >= 5 ? params->encoder_mode : OV_ENCODER_EAGER;
+    if (requested_mode != OV_ENCODER_EAGER && requested_mode != OV_ENCODER_LAZY &&
+        requested_mode != OV_ENCODER_ON_DEMAND) {
+        ov_set_error("ov_init: encoder_mode %d is not a valid ov_encoder_mode", (int) requested_mode);
+        ov_log(OV_LOG_ERROR, "[OmniVoice] ov_init got an invalid encoder_mode (%d)", (int) requested_mode);
+        return nullptr;
+    }
+    const CodecEncoderMode encoder_mode = requested_mode == OV_ENCODER_LAZY        ? CODEC_ENCODER_LAZY
+                                          : requested_mode == OV_ENCODER_ON_DEMAND ? CODEC_ENCODER_ON_DEMAND
+                                                                                   : CODEC_ENCODER_EAGER;
     if (upscaler_path && !*upscaler_path) {
         ov_set_error("ov_init: upscaler_path must be NULL or a non-empty path");
         ov_log(OV_LOG_ERROR, "[Upscaler] upscaler_path is an empty string");
@@ -291,7 +311,7 @@ struct ov_context * ov_init(const struct ov_init_params * params) {
         }
 
         if (params->codec_path) {
-            if (!pipeline_codec_load(&ov->pc, params->codec_path, ov->bp)) {
+            if (!pipeline_codec_load(&ov->pc, params->codec_path, ov->bp, encoder_mode)) {
                 ov_throw("ov_init: pipeline_codec_load failed for '%s'", params->codec_path);
             }
             ov->codec_loaded = true;
@@ -453,6 +473,20 @@ void ov_voice_ref_free(struct ov_voice_ref * ref) {
     ref->ref_codes     = nullptr;
     ref->ref_T         = 0;
     ref->num_codebooks = 0;
+}
+
+void ov_release_voice_encoder(struct ov_context * ov) {
+    if (!ov || !ov->codec_loaded) {
+        return;
+    }
+    pipeline_codec_encoder_unload(&ov->pc);
+}
+
+uint64_t ov_voice_encoder_bytes(const struct ov_context * ov) {
+    if (!ov || !ov->codec_loaded) {
+        return 0;
+    }
+    return (uint64_t) pipeline_codec_encoder_bytes(&ov->pc);
 }
 
 enum ov_status ov_extract_voice_ref(struct ov_context *   ov,

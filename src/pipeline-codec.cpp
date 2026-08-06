@@ -30,10 +30,158 @@
 #include <cstdlib>
 #include <cstring>
 
-bool pipeline_codec_load(PipelineCodec * pc, const char * gguf_path, BackendPair bp) {
+// Load the encode-side modules from an already-open GGUF mapping. On failure
+// it unwinds whatever it managed to load, leaving the decode side untouched.
+// Callers own opening and closing pc->gguf around this.
+static bool codec_encoder_load_modules(PipelineCodec * pc) {
+    ggml_backend_t backend = pc->backend;
+
+    // DAC encoder mirrors the decoder's private weight ctx pattern. It is the
+    // counterpart of the decoder used during the encode side of the codec
+    // pipeline (waveform -> latent), and reuses the same load helpers.
+    if (!dac_enc_load(&pc->dac_enc, pc->gguf, backend)) {
+        return false;
+    }
+
+    // SemanticEncoder refines the HuBERT semantic features before the joint
+    // fc + RVQ encode stage. Its private weight ctx mirrors the DAC pattern
+    // for consistency, even though it has no per-tensor transforms.
+    if (!sem_enc_load(&pc->sem_enc, pc->gguf, backend)) {
+        dac_enc_free(&pc->dac_enc);
+        return false;
+    }
+
+    // HuBERT feature_extractor: 7 conv stack with GroupNorm on layer 0 and
+    // GELU on every layer. Cumulative stride 320 over 16 kHz audio.
+    if (!hubert_feat_load(&pc->hubert_feat, pc->gguf, backend)) {
+        sem_enc_free(&pc->sem_enc);
+        dac_enc_free(&pc->dac_enc);
+        return false;
+    }
+
+    // HuBERT feature_projection: LN(512) + Linear(512, 768). Bridges the
+    // feature_extractor (T fast layout) to the transformer encoder which
+    // operates in C-first layout (C fast, T slow).
+    if (!hubert_proj_load(&pc->hubert_proj, pc->gguf, backend)) {
+        hubert_feat_free(&pc->hubert_feat);
+        sem_enc_free(&pc->sem_enc);
+        dac_enc_free(&pc->dac_enc);
+        return false;
+    }
+
+    // HuBERT encoder init block: grouped pos_conv_embed (residual add) +
+    // first LayerNorm. Sits between feature_projection and the 12-layer stack.
+    if (!hubert_enc_init_load(&pc->hubert_enc_init, pc->gguf, backend)) {
+        hubert_proj_free(&pc->hubert_proj);
+        hubert_feat_free(&pc->hubert_feat);
+        sem_enc_free(&pc->sem_enc);
+        dac_enc_free(&pc->dac_enc);
+        return false;
+    }
+
+    // HuBERT transformer encoder: 12 Post-LN layers loaded in sequence. Each
+    // layer owns its own backend buffer for clean lifecycle. On failure at
+    // index i, we unwind layers [0, i) before the rest of the chain.
+    for (int i = 0; i < HUBERT_NUM_LAYERS; i++) {
+        if (!hubert_layer_load(&pc->hubert_layers[i], pc->gguf, backend, i)) {
+            for (int j = 0; j < i; j++) {
+                hubert_layer_free(&pc->hubert_layers[j]);
+            }
+            hubert_enc_init_free(&pc->hubert_enc_init);
+            hubert_proj_free(&pc->hubert_proj);
+            hubert_feat_free(&pc->hubert_feat);
+            sem_enc_free(&pc->sem_enc);
+            dac_enc_free(&pc->dac_enc);
+            return false;
+        }
+    }
+    size_t stack_bytes = 0;
+    for (int i = 0; i < HUBERT_NUM_LAYERS; i++) {
+        stack_bytes += ggml_backend_buffer_get_size(pc->hubert_layers[i].weight_buf);
+    }
+    ov_log(OV_LOG_INFO, "[HuBERT-Stack] Loaded: %d layers, hidden=%d heads=%d ffn=%d, weights %.1f MB",
+           HUBERT_NUM_LAYERS, HUBERT_HIDDEN, HUBERT_NUM_HEADS, HUBERT_FFN_INNER, (float) stack_bytes / (1024 * 1024));
+
+    pc->encoder_loaded = true;
+    return true;
+}
+
+size_t pipeline_codec_encoder_bytes(const PipelineCodec * pc) {
+    if (!pc->encoder_loaded) {
+        return 0;
+    }
+    size_t bytes = 0;
+    for (int i = 0; i < HUBERT_NUM_LAYERS; i++) {
+        if (pc->hubert_layers[i].weight_buf) {
+            bytes += ggml_backend_buffer_get_size(pc->hubert_layers[i].weight_buf);
+        }
+    }
+    const ggml_backend_buffer_t bufs[] = {
+        pc->hubert_enc_init.weight_buf, pc->hubert_enc_init.pos.weight_buf, pc->hubert_proj.weight_buf,
+        pc->hubert_feat.weight_buf,     pc->sem_enc.weight_buf,             pc->dac_enc.weight_buf,
+    };
+    for (ggml_backend_buffer_t buf : bufs) {
+        if (buf) {
+            bytes += ggml_backend_buffer_get_size(buf);
+        }
+    }
+    return bytes;
+}
+
+bool pipeline_codec_encoder_load(PipelineCodec * pc) {
+    if (pc->encoder_loaded) {
+        return true;
+    }
+    if (pc->gguf_path.empty()) {
+        ov_log(OV_LOG_ERROR, "[PipelineCodec] cannot load encoder: no GGUF path retained");
+        return false;
+    }
+
+    // The decode-side load already closed the mmap, so reopen it for the
+    // duration of this call. The loaders read raw mmap pointers.
+    if (!gf_load(&pc->gguf, pc->gguf_path.c_str())) {
+        return false;
+    }
+    const bool ok = codec_encoder_load_modules(pc);
+    gf_close(&pc->gguf);
+    if (!ok) {
+        ov_log(OV_LOG_ERROR, "[PipelineCodec] encoder load failed");
+        return false;
+    }
+    ov_log(OV_LOG_INFO, "[PipelineCodec] Encoder resident: %.1f MB",
+           (float) pipeline_codec_encoder_bytes(pc) / (1024 * 1024));
+    return true;
+}
+
+void pipeline_codec_encoder_unload(PipelineCodec * pc) {
+    if (!pc->encoder_loaded) {
+        return;
+    }
+    const float freed_mb = (float) pipeline_codec_encoder_bytes(pc) / (1024 * 1024);
+    for (int i = 0; i < HUBERT_NUM_LAYERS; i++) {
+        hubert_layer_free(&pc->hubert_layers[i]);
+    }
+    hubert_enc_init_free(&pc->hubert_enc_init);
+    hubert_proj_free(&pc->hubert_proj);
+    hubert_feat_free(&pc->hubert_feat);
+    sem_enc_free(&pc->sem_enc);
+    dac_enc_free(&pc->dac_enc);
+    pc->encoder_loaded = false;
+
+    // Graphs built against the freed weight tensors are gone with them, so the
+    // scheduler's tensor->backend assignments must not outlive them.
+    if (pc->sched) {
+        ggml_backend_sched_reset(pc->sched);
+    }
+    ov_log(OV_LOG_INFO, "[PipelineCodec] Encoder released: %.1f MB freed", freed_mb);
+}
+
+bool pipeline_codec_load(PipelineCodec * pc, const char * gguf_path, BackendPair bp, CodecEncoderMode mode) {
     *pc                    = {};
     pc->bp                 = bp;
     pc->backend            = bp.backend;
+    pc->gguf_path          = gguf_path ? gguf_path : "";
+    pc->encoder_mode       = mode;
     ggml_backend_t backend = bp.backend;
 
     if (!gf_load(&pc->gguf, gguf_path)) {
@@ -92,89 +240,15 @@ bool pipeline_codec_load(PipelineCodec * pc, const char * gguf_path, BackendPair
         return false;
     }
 
-    // DAC encoder mirrors the same private weight ctx pattern. It is the
-    // counterpart of the decoder used during the encode side of the codec
-    // pipeline (waveform -> latent), and reuses the same load helpers.
-    if (!dac_enc_load(&pc->dac_enc, pc->gguf, backend)) {
+    // Encode-side modules (DAC encoder, SemanticEncoder, HuBERT stack). Only
+    // EAGER pays for them here; the other modes defer to the first encode so
+    // a caller with pre-encoded references never resides them at all.
+    if (mode == CODEC_ENCODER_EAGER && !codec_encoder_load_modules(pc)) {
         dac_free(&pc->dac);
         wctx_free(&pc->wctx);
         gf_close(&pc->gguf);
         return false;
     }
-
-    // SemanticEncoder refines the HuBERT semantic features before the joint
-    // fc + RVQ encode stage. Its private weight ctx mirrors the DAC pattern
-    // for consistency, even though it has no per-tensor transforms.
-    if (!sem_enc_load(&pc->sem_enc, pc->gguf, backend)) {
-        dac_enc_free(&pc->dac_enc);
-        dac_free(&pc->dac);
-        wctx_free(&pc->wctx);
-        gf_close(&pc->gguf);
-        return false;
-    }
-
-    // HuBERT feature_extractor: 7 conv stack with GroupNorm on layer 0 and
-    // GELU on every layer. Cumulative stride 320 over 16 kHz audio.
-    if (!hubert_feat_load(&pc->hubert_feat, pc->gguf, backend)) {
-        sem_enc_free(&pc->sem_enc);
-        dac_enc_free(&pc->dac_enc);
-        dac_free(&pc->dac);
-        wctx_free(&pc->wctx);
-        gf_close(&pc->gguf);
-        return false;
-    }
-
-    // HuBERT feature_projection: LN(512) + Linear(512, 768). Bridges the
-    // feature_extractor (T fast layout) to the transformer encoder which
-    // operates in C-first layout (C fast, T slow).
-    if (!hubert_proj_load(&pc->hubert_proj, pc->gguf, backend)) {
-        hubert_feat_free(&pc->hubert_feat);
-        sem_enc_free(&pc->sem_enc);
-        dac_enc_free(&pc->dac_enc);
-        dac_free(&pc->dac);
-        wctx_free(&pc->wctx);
-        gf_close(&pc->gguf);
-        return false;
-    }
-
-    // HuBERT encoder init block: grouped pos_conv_embed (residual add) +
-    // first LayerNorm. Sits between feature_projection and the 12-layer stack.
-    if (!hubert_enc_init_load(&pc->hubert_enc_init, pc->gguf, backend)) {
-        hubert_proj_free(&pc->hubert_proj);
-        hubert_feat_free(&pc->hubert_feat);
-        sem_enc_free(&pc->sem_enc);
-        dac_enc_free(&pc->dac_enc);
-        dac_free(&pc->dac);
-        wctx_free(&pc->wctx);
-        gf_close(&pc->gguf);
-        return false;
-    }
-
-    // HuBERT transformer encoder: 12 Post-LN layers loaded in sequence. Each
-    // layer owns its own backend buffer for clean lifecycle. On failure at
-    // index i, we unwind layers [0, i) before the rest of the chain.
-    for (int i = 0; i < HUBERT_NUM_LAYERS; i++) {
-        if (!hubert_layer_load(&pc->hubert_layers[i], pc->gguf, backend, i)) {
-            for (int j = 0; j < i; j++) {
-                hubert_layer_free(&pc->hubert_layers[j]);
-            }
-            hubert_enc_init_free(&pc->hubert_enc_init);
-            hubert_proj_free(&pc->hubert_proj);
-            hubert_feat_free(&pc->hubert_feat);
-            sem_enc_free(&pc->sem_enc);
-            dac_enc_free(&pc->dac_enc);
-            dac_free(&pc->dac);
-            wctx_free(&pc->wctx);
-            gf_close(&pc->gguf);
-            return false;
-        }
-    }
-    size_t stack_bytes = 0;
-    for (int i = 0; i < HUBERT_NUM_LAYERS; i++) {
-        stack_bytes += ggml_backend_buffer_get_size(pc->hubert_layers[i].weight_buf);
-    }
-    ov_log(OV_LOG_INFO, "[HuBERT-Stack] Loaded: %d layers, hidden=%d heads=%d ffn=%d, weights %.1f MB",
-           HUBERT_NUM_LAYERS, HUBERT_HIDDEN, HUBERT_NUM_HEADS, HUBERT_FFN_INNER, (float) stack_bytes / (1024 * 1024));
 
     // All weights are now on the backend. The mmap is no longer needed.
     gf_close(&pc->gguf);
@@ -359,6 +433,20 @@ std::vector<int32_t> pipeline_codec_encode(PipelineCodec * pc,
         return {};
     }
 
+    // Step 0: make sure the encode-side weights are resident. In ON_DEMAND
+    // mode they are released again before returning, on every exit path.
+    if (!pipeline_codec_encoder_load(pc)) {
+        return {};
+    }
+    struct EncoderScope {
+        PipelineCodec * pc;
+        ~EncoderScope() {
+            if (pc->encoder_mode == CODEC_ENCODER_ON_DEMAND) {
+                pipeline_codec_encoder_unload(pc);
+            }
+        }
+    } encoder_scope{ pc };
+
     // Step 1: resample 24 kHz -> 16 kHz mono and pad with 160 zeros on each
     // side, matching HiggsAudioV2 _extract_semantic_features.
     int     n_16k     = 0;
@@ -537,7 +625,10 @@ std::vector<int32_t> pipeline_codec_encode(PipelineCodec * pc,
 void pipeline_codec_free(PipelineCodec * pc) {
     if (pc->sched) {
         ggml_backend_sched_free(pc->sched);
+        pc->sched = NULL;
     }
+    // Unconditional: the module frees are NULL-safe, so this stays correct on
+    // a partially-loaded struct regardless of encoder_loaded.
     for (int i = 0; i < HUBERT_NUM_LAYERS; i++) {
         hubert_layer_free(&pc->hubert_layers[i]);
     }

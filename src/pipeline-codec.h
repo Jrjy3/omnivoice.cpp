@@ -16,7 +16,21 @@
 #include "weight-ctx.h"
 
 #include <cstdint>
+#include <string>
 #include <vector>
+
+// Residency policy for the encode-side modules (DAC encoder, SemanticEncoder,
+// HuBERT stack). Decode-side weights are always resident: synthesis needs them
+// on every call. The encoder is only needed to turn a raw reference waveform
+// into RVQ codes, which a caller that caches its codes does once per voice.
+//   EAGER     : load at pipeline_codec_load, keep forever (pre-v5 behaviour).
+//   LAZY      : load on the first encode, keep until unload/free.
+//   ON_DEMAND : load on each encode, release as soon as it returns.
+enum CodecEncoderMode {
+    CODEC_ENCODER_EAGER     = 0,
+    CODEC_ENCODER_LAZY      = 1,
+    CODEC_ENCODER_ON_DEMAND = 2,
+};
 
 struct PipelineCodec {
     // GGUF source. Mmap is closed inside pipeline_codec_load once the data
@@ -60,11 +74,33 @@ struct PipelineCodec {
     // Audio metadata read from GGUF KV
     int sample_rate;  // 24000
     int hop_length;   // 960 (cumulative DAC upsample stride)
+
+    // Encoder residency. gguf_path is retained so the encode-side modules can
+    // be reloaded after the mmap is closed; encoder_loaded tracks whether the
+    // modules above (dac_enc, sem_enc, hubert_*) currently hold weights.
+    std::string      gguf_path;
+    CodecEncoderMode encoder_mode;
+    bool             encoder_loaded;
 };
 
-// Open the GGUF, load all weights to the backend, close the GGUF mapping.
+// Open the GGUF, load the decode-side weights to the backend, close the GGUF
+// mapping. The encode-side modules are loaded here only when mode is EAGER.
 // Returns true on success. On failure the struct is left in a clean state.
-bool pipeline_codec_load(PipelineCodec * pc, const char * gguf_path, BackendPair bp);
+bool pipeline_codec_load(PipelineCodec * pc,
+                         const char *     gguf_path,
+                         BackendPair      bp,
+                         CodecEncoderMode mode = CODEC_ENCODER_EAGER);
+
+// Load the encode-side modules if they are not resident. Reopens the GGUF for
+// the duration of the load. No-op returning true when already loaded.
+bool pipeline_codec_encoder_load(PipelineCodec * pc);
+
+// Release the encode-side modules and their backend buffers. Safe to call at
+// any time, including when nothing is loaded; decode stays fully functional.
+void pipeline_codec_encoder_unload(PipelineCodec * pc);
+
+// Backend bytes currently held by the encode-side modules. 0 when unloaded.
+size_t pipeline_codec_encoder_bytes(const PipelineCodec * pc);
 
 // Decode RVQ codes into a mono 24 kHz waveform.
 //   codes: row-major i32, num_codebooks rows of n_frames each (T fast).

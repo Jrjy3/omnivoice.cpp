@@ -60,11 +60,13 @@ int main(void) {
     struct ov_tts_params params;
     ov_tts_default_params(&params);
 
-    /* Touch the explicit v4 entry points as well as the current-header macro
-     * redirects above, so both source and binary names are link-checked. */
+    /* Touch the explicit v4 and v5 entry points as well as the current-header
+     * macro redirects above, so both source and binary names are link-checked. */
     struct ov_init_params explicit_v4_iparams;
+    struct ov_init_params explicit_v5_iparams;
     struct ov_tts_params explicit_v4_params;
     ov_init_default_params_v4(&explicit_v4_iparams);
+    ov_init_default_params_v5(&explicit_v5_iparams);
     ov_tts_default_params_v4(&explicit_v4_params);
 
     /* Sanity-check a few default values, including the new abi_version. */
@@ -73,12 +75,22 @@ int main(void) {
         return 1;
     }
     if (iparams.abi_version != OV_ABI_VERSION || params.abi_version != OV_ABI_VERSION ||
-        explicit_v4_iparams.abi_version != OV_ABI_VERSION || explicit_v4_params.abi_version != OV_ABI_VERSION) {
-        fprintf(stderr, "[Probe] ABI-v4 defaults did not report the current version\n");
+        explicit_v5_iparams.abi_version != OV_ABI_VERSION || explicit_v4_params.abi_version != OV_ABI_VERSION) {
+        fprintf(stderr, "[Probe] ABI-v5 defaults did not report the current version\n");
+        return 1;
+    }
+    /* The v4 initializer must keep claiming 4: a caller built against the v4
+     * header has no encoder_mode field for ov_init to read. */
+    if (explicit_v4_iparams.abi_version != 4) {
+        fprintf(stderr, "[Probe] ABI-v4 defaults did not report version 4\n");
         return 1;
     }
     if (iparams.upscaler_path != NULL) {
         fprintf(stderr, "[Probe] upscaler_path default is not NULL\n");
+        return 1;
+    }
+    if (iparams.encoder_mode != OV_ENCODER_EAGER) {
+        fprintf(stderr, "[Probe] encoder_mode default is not OV_ENCODER_EAGER\n");
         return 1;
     }
 
@@ -93,6 +105,14 @@ int main(void) {
 
     struct ov_voice_ref voice_ref = { 0 };
     ov_voice_ref_free(&voice_ref);
+
+    /* v5 encoder-residency entry points. Both are NULL-safe, so this is a
+     * pure link and signature check that needs no model. */
+    ov_release_voice_encoder(NULL);
+    if (ov_voice_encoder_bytes(NULL) != 0) {
+        fprintf(stderr, "[Probe] ov_voice_encoder_bytes(NULL) is not 0\n");
+        return 1;
+    }
 
     /* Install the log callback before the failing init so the [OmniVoice]
      * ERROR line lands on stub_log instead of stderr. */

@@ -54,7 +54,7 @@ extern "C" {
 // There is no separate semver triple. The runtime build identity is the
 // git short hash + commit date string returned by ov_version(); for
 // binding compat checks, OV_ABI_VERSION is the only number that matters.
-#define OV_ABI_VERSION 4
+#define OV_ABI_VERSION 5
 
 // Returns a static string of the form "<git-hash> (<date>)" identifying
 // the exact commit this binary was built from. Safe to call from any
@@ -108,6 +108,24 @@ struct ov_context;
 // preserves native 24 kHz output; a supplied VAE-only GGUF is eagerly loaded
 // and makes buffered synthesis return 48 kHz. abi_version stays first so a
 // future struct growth keeps reading the version field at offset 0.
+// Residency policy for the codec's voice encoder (DAC encoder, semantic
+// encoder, HuBERT stack: roughly 300-500 MB of backend memory). It is only
+// needed to turn raw reference audio into RVQ codes; a caller that caches
+// codes per voice needs it once and never again. Synthesis from
+// ov_tts_params.ref_audio_tokens never touches it.
+enum ov_encoder_mode {
+    // Loaded at ov_init and resident for the handle's lifetime. Pre-v5
+    // behaviour and the default, so existing callers are unaffected.
+    OV_ENCODER_EAGER = 0,
+    // Loaded on the first call that needs it, then resident. Combine with
+    // ov_release_voice_encoder to control exactly when it is given back.
+    OV_ENCODER_LAZY = 1,
+    // Loaded per call and released as soon as it returns. Lowest steady-state
+    // footprint; costs a reload (a few hundred MB off the page cache) per
+    // reference encode.
+    OV_ENCODER_ON_DEMAND = 2,
+};
+
 struct ov_init_params {
     int          abi_version;
     const char * model_path;
@@ -115,6 +133,8 @@ struct ov_init_params {
     bool         use_fa;
     bool         clamp_fp16;
     const char * upscaler_path;
+    // ABI v5. Read only when abi_version >= 5; older callers get EAGER.
+    enum ov_encoder_mode encoder_mode;
 };
 
 // Legacy ABI-v3 initializer symbol. It writes only the v3 prefix and sets
@@ -122,10 +142,14 @@ struct ov_init_params {
 // safe if it loads a v4 library.
 OV_API void ov_init_default_params(struct ov_init_params * p);
 
-// ABI-v4 initializer: standard defaults plus upscaler_path NULL. New source
-// callers are redirected here while the old binary symbol remains available.
+// ABI-v4 initializer: standard defaults plus upscaler_path NULL. Retained as
+// a binary symbol for callers built against the v4 header.
 OV_API void ov_init_default_params_v4(struct ov_init_params * p);
-#define ov_init_default_params ov_init_default_params_v4
+
+// ABI-v5 initializer: v4 defaults plus encoder_mode = OV_ENCODER_EAGER. New
+// source callers are redirected here; older binary symbols remain available.
+OV_API void ov_init_default_params_v5(struct ov_init_params * p);
+#define ov_init_default_params ov_init_default_params_v5
 
 // Allocate every module described by params. Returns NULL on any failure
 // after releasing whatever it has allocated so far. The returned handle
@@ -322,6 +346,17 @@ OV_API enum ov_status ov_extract_voice_ref(struct ov_context *   ov,
 // Release the RVQ code buffer and reset the struct to empty. Safe on a
 // zero initialised struct.
 OV_API void ov_voice_ref_free(struct ov_voice_ref * ref);
+
+// Release the codec's voice encoder, returning its backend memory. Safe at
+// any time and on any encoder_mode: a later ov_extract_voice_ref or raw-audio
+// synthesis transparently reloads it. Intended for a caller that has just
+// finished pre-processing its voices and wants the VRAM back for the rest of
+// the session. No-op when the encoder is not resident.
+OV_API void ov_release_voice_encoder(struct ov_context * ov);
+
+// Backend bytes currently held by the voice encoder, 0 when it is not
+// resident. Lets a caller show the saving in a VRAM meter.
+OV_API uint64_t ov_voice_encoder_bytes(const struct ov_context * ov);
 
 #ifdef __cplusplus
 }
